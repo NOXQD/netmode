@@ -39,7 +39,34 @@ done
 sed "s|@EXE@|$exe|" "$here/plugin/Env.js.in" >"$plugin_dir/Env.js"
 chmod 644 "$plugin_dir/Env.js"
 
+ext_dir=$HOME/.local/share/netmode/extension
+install -d "$ext_dir"
+install -m 644 "$here"/extension/manifest.json "$here"/extension/background.js "$ext_dir/"
+
+# Chromium reads its flags once at start; the extension is picked up on the next launch.
+flags=$HOME/.config/chromium-flags.conf
+if [[ -f $flags ]] && ! grep -qF "$ext_dir" "$flags"; then
+  [[ -e $flags.netmode-bak ]] || cp "$flags" "$flags.netmode-bak"
+  if grep -q '^--load-extension=' "$flags"; then
+    sed -i "s|^--load-extension=\(.*\)\$|--load-extension=\1,$ext_dir|" "$flags"
+  else
+    echo "--load-extension=$ext_dir" >>"$flags"
+  fi
+fi
+
 install -d "$HOME/.config/systemd/user"
+cat >"$HOME/.config/systemd/user/netmode-proxy.service" <<UNIT
+[Unit]
+Description=netmode: local accelerator for the AnimeLib video servers
+
+[Service]
+ExecStart=$exe proxy
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+UNIT
 cat >"$HOME/.config/systemd/user/netmode-watch.service" <<UNIT
 [Unit]
 Description=netmode: video profile while AnimeLib is open
@@ -56,8 +83,8 @@ Nice=10
 WantedBy=graphical-session.target
 UNIT
 systemctl --user daemon-reload
-systemctl --user enable --now netmode-watch.service >/dev/null 2>&1 || true
-systemctl --user restart netmode-watch.service || true
+systemctl --user enable --now netmode-watch.service netmode-proxy.service >/dev/null 2>&1 || true
+systemctl --user restart netmode-watch.service netmode-proxy.service || true
 
 if ! grep -q "\"$plugin_id\"" "$HOME/.config/omarchy/shell.json" 2>/dev/null; then
   omarchy plugin enable "$plugin_id" || echo "enable it with: omarchy plugin enable $plugin_id"
@@ -65,4 +92,5 @@ fi
 if (( do_restart )); then
   omarchy restart shell || true
 fi
-echo "netmode installed. Try: netmode, netmode set video, netmode bench"
+echo "netmode installed. Restart Chromium once to load the video accelerator."
+echo "Try: netmode, netmode set video, netmode bench"

@@ -3,8 +3,12 @@
 set -uo pipefail
 plugin_id=noxqd.netmode
 
-systemctl --user disable --now netmode-watch.service 2>/dev/null
-rm -f "$HOME/.config/systemd/user/netmode-watch.service"
+systemctl --user disable --now netmode-watch.service netmode-proxy.service 2>/dev/null
+rm -f "$HOME/.config/systemd/user/netmode-watch.service" "$HOME/.config/systemd/user/netmode-proxy.service"
+ext_dir=$HOME/.local/share/netmode/extension
+flags=$HOME/.config/chromium-flags.conf
+[[ -f $flags ]] && sed -i -e "s|,$ext_dir||" -e "\|^--load-extension=$ext_dir\$|d" "$flags"
+rm -rf "$HOME/.local/share/netmode"
 systemctl --user daemon-reload
 omarchy plugin disable "$plugin_id" 2>/dev/null
 rm -rf "$HOME/.config/omarchy/plugins/$plugin_id" "$HOME/.local/bin/netmode"
