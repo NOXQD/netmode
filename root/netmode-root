@@ -1,0 +1,227 @@
+#!/usr/bin/python3 -I
+"""netmode-root: the privileged half of netmode.
+
+Installed root-owned in /usr/local/lib/netmode/ and run through pkexec (polkit
+action dev.noxqd.netmode.apply). It takes exactly one of a fixed set of mode
+names and applies the tuning stored in this file. It never reads a path, a
+value or a command from the caller, so a user who can run it can do nothing
+beyond switching between the modes below.
+
+    netmode-root list        modes as JSON (no privileges needed)
+    netmode-root apply MODE  apply a mode (root)
+    netmode-root state       what is applied right now, as JSON
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+STATE_DIR = "/run/netmode"
+STATE_FILE = STATE_DIR + "/state.json"
+
+# Every key any mode touches. A mode only lists what differs; the rest comes
+# from here, so switching modes never leaves a setting of the previous one.
+BASE = {
+    "net.core.default_qdisc": "fq",
+    "net.ipv4.tcp_congestion_control": "bbr",
+    "net.ipv4.tcp_fastopen": "3",
+    "net.ipv4.tcp_slow_start_after_idle": "0",
+    "net.ipv4.tcp_mtu_probing": "1",
+    "net.core.rmem_max": "16777216",
+    "net.core.wmem_max": "16777216",
+    "net.ipv4.tcp_rmem": "4096 131072 33554432",
+    "net.ipv4.tcp_wmem": "4096 16384 16777216",
+    "net.core.netdev_max_backlog": "4096",
+    "net.core.netdev_budget": "300",
+    "net.ipv4.tcp_notsent_lowat": "4294967295",
+    "net.core.busy_poll": "0",
+    "net.core.busy_read": "0",
+}
+
+MODES = {
+    "balanced": {
+        "name": "Обычный",
+        "icon": "\U000f04c5",
+        "blurb": "Повседневная работа, BBR",
+        "wifi_awake": False,
+        "keepalive": False,
+        "sysctl": {},
+    },
+    "video": {
+        "name": "Видео",
+        "icon": "\U000f0567",
+        "blurb": "AnimeLib и стримы без рывков",
+        "wifi_awake": True,
+        "keepalive": False,
+        "sysctl": {
+            "net.core.rmem_max": "67108864",
+            "net.ipv4.tcp_rmem": "4096 262144 67108864",
+            "net.core.netdev_max_backlog": "8192",
+            "net.core.netdev_budget": "600",
+        },
+    },
+    "gaming": {
+        "name": "Игры",
+        "icon": "\U000f02b4",
+        "blurb": "Минимальный пинг и джиттер",
+        "wifi_awake": True,
+        "keepalive": False,
+        "sysctl": {
+            "net.ipv4.tcp_notsent_lowat": "16384",
+            "net.core.busy_poll": "50",
+            "net.core.busy_read": "50",
+        },
+    },
+    "download": {
+        "name": "Загрузка",
+        "icon": "\U000f01da",
+        "blurb": "Максимум скорости загрузки",
+        "wifi_awake": True,
+        "keepalive": False,
+        "sysctl": {
+            "net.core.rmem_max": "134217728",
+            "net.core.wmem_max": "134217728",
+            "net.ipv4.tcp_rmem": "4096 262144 134217728",
+            "net.ipv4.tcp_wmem": "4096 65536 134217728",
+            "net.core.netdev_max_backlog": "16384",
+            "net.core.netdev_budget": "600",
+        },
+    },
+}
+
+IFACE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
+
+
+def sysctl_path(key):
+    return "/proc/sys/" + key.replace(".", "/")
+
+
+def sysctl_get(key):
+    try:
+        with open(sysctl_path(key)) as f:
+            return " ".join(f.read().split())
+    except OSError:
+        return None
+
+
+def sysctl_set(key, value):
+    try:
+        with open(sysctl_path(key), "w") as f:
+            f.write(value)
+        return None
+    except OSError as e:
+        return "%s=%s: %s" % (key, value, e.strerror)
+
+
+def wireless_ifaces():
+    base = "/sys/class/net"
+    out = []
+    for name in sorted(os.listdir(base)):
+        if IFACE.match(name) and os.path.isdir("%s/%s/wireless" % (base, name)):
+            out.append(name)
+    return out
+
+
+def run(*argv):
+    try:
+        subprocess.run(argv, check=False, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def on_ac():
+    base = "/sys/class/power_supply"
+    try:
+        for name in os.listdir(base):
+            d = base + "/" + name
+            with open(d + "/type") as t:
+                if t.read().strip() == "Mains":
+                    with open(d + "/online") as o:
+                        if o.read().strip() == "1":
+                            return True
+    except OSError:
+        pass
+    return False
+
+
+def pci_power(iface, awake):
+    """Keep the Wi-Fi card out of D3 between packets: removes wake-up latency."""
+    path = "/sys/class/net/%s/device/power/control" % iface
+    try:
+        with open(path, "w") as f:
+            f.write("on" if awake else "auto")
+        return None
+    except OSError as e:
+        return "%s: %s" % (path, e.strerror)
+
+
+def apply(mode):
+    spec = MODES[mode]
+    errors = []
+    run("/usr/bin/modprobe", "tcp_bbr")
+    run("/usr/bin/modprobe", "sch_fq")
+    values = dict(BASE)
+    values.update(spec["sysctl"])
+    for key in sorted(values):
+        err = sysctl_set(key, values[key])
+        if err:
+            errors.append(err)
+    for iface in wireless_ifaces():
+        run("/usr/bin/iw", "dev", iface, "set", "power_save", "off")
+        # The balanced profile still keeps the card awake on mains power: an
+        # idle card here adds 100-200 ms latency spikes (measured: 11-16 of
+        # 200 pings over 20 ms, none with power/control=on).
+        err = pci_power(iface, spec["wifi_awake"] or on_ac())
+        if err:
+            errors.append(err)
+    os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"mode": mode, "since": int(time.time()), "errors": errors}, f)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, STATE_FILE)
+    return errors
+
+
+def state():
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        if data.get("mode") in MODES:
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"mode": "balanced", "since": 0, "errors": [], "default": True}
+
+
+def listing():
+    return [dict(id=k, **{f: v[f] for f in ("name", "icon", "blurb", "keepalive")}) for k, v in MODES.items()]
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    if cmd == "list" and len(argv) == 2:
+        json.dump(listing(), sys.stdout, ensure_ascii=False)
+        print()
+        return 0
+    if cmd == "state" and len(argv) == 2:
+        json.dump(state(), sys.stdout)
+        print()
+        return 0
+    if cmd == "apply" and len(argv) == 3 and argv[2] in MODES:
+        if os.geteuid() != 0:
+            print("netmode-root: apply needs root (run through pkexec)", file=sys.stderr)
+            return 77
+        errors = apply(argv[2])
+        for e in errors:
+            print("warn:", e, file=sys.stderr)
+        return 0
+    print(__doc__, file=sys.stderr)
+    return 64
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
