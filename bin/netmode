@@ -46,6 +46,7 @@ DEFAULT_CONFIG = {
     "browsers": ["chromium", "chrome", "brave", "vivaldi", "firefox", "zen", "opera"],
     "proxy_port": 18765,
     "proxy_hosts": [r"^video\d*\.cdnlibs\.org$"],
+    "proxy_ahead_mb": 160,
 }
 
 
@@ -468,7 +469,9 @@ def cmd_keepalive(args):
 
 SPAN_FIRST = 1 << 20
 SPAN_MAX = 8 << 20
-WINDOW = 6
+FETCHERS = 8
+AHEAD = 160 << 20             # how far past the player's position the proxy keeps fetching
+CACHE_MAX = 320 << 20
 
 
 def spans(start, end):
@@ -496,20 +499,57 @@ def parse_range(header, total):
     return (start, end) if start <= end and start < total else None
 
 
+class SlowConnection(Exception):
+    pass
+
+
 class CancelledError(Exception):
     pass
 
 
-class SlowConnection(Exception):
-    pass
+class SpanCache:
+    """Fetched byte ranges of the videos in memory, least recently used out first."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.lock = threading.Lock()
+        self.files = {}
+        self.lru = collections.OrderedDict()
+        self.size = 0
+
+    def add(self, key, start, data):
+        with self.lock:
+            segs = self.files.setdefault(key, {})
+            old = segs.get(start)
+            if old is not None:
+                self.size -= len(old)
+            segs[start] = data
+            self.size += len(data)
+            self.lru[(key, start)] = True
+            self.lru.move_to_end((key, start))
+            while self.size > self.limit and self.lru:
+                (k, st), _ = self.lru.popitem(last=False)
+                self.size -= len(self.files[k].pop(st))
+
+    def read(self, key, pos):
+        """The cached bytes from pos to the end of the segment holding it, or None."""
+        with self.lock:
+            for st, data in self.files.get(key, {}).items():
+                if st <= pos < st + len(data):
+                    self.lru.move_to_end((key, st))
+                    return memoryview(data)[pos - st:]
+        return None
 
 
 class Origin:
     """Short-lived connections to the video hosts, with a small size cache."""
 
-    def __init__(self, scheme="https"):
+    def __init__(self, scheme="https", ahead=AHEAD):
         self.scheme = scheme
-        self.pool = cf.ThreadPoolExecutor(max_workers=16)
+        self.ahead = ahead
+        self.cache = SpanCache(ahead * 2)
+        self.pool = cf.ThreadPoolExecutor(max_workers=FETCHERS)
+        self.urgent = cf.ThreadPoolExecutor(max_workers=FETCHERS)
         self.meta = {}
         self.lock = threading.Lock()
         self.served = 0
@@ -528,29 +568,35 @@ class Origin:
         conn.request("GET", path, headers=hdr)
         return conn, conn.getresponse()
 
-    def probe(self, host, path, headers):
-        """(status, info) where info has size, type and validators; cached for ten minutes."""
+    def probe(self, host, path, headers, first=None):
+        """Size and validators of a file; cached for ten minutes.
+
+        When the first range the player wants is known, it is requested here
+        and kept, so the size costs no extra round trip.
+        """
         key = (host, path)
         with self.lock:
             hit = self.meta.get(key)
         if hit and time.time() - hit[0] < 600:
             return hit[1]
-        conn, r = self.get(host, path, headers, (0, 0))
+        conn, r = self.get(host, path, headers, first or (0, 0))
         try:
-            r.read()
+            data = r.read()
             info = {"status": r.status, "type": r.getheader("Content-Type", "video/mp4"),
                     "etag": r.getheader("ETag"), "modified": r.getheader("Last-Modified"),
                     "size": None}
-            cr = r.getheader("Content-Range", "")
-            if r.status == 206 and "/" in cr and cr.rsplit("/", 1)[1].isdigit():
-                info["size"] = int(cr.rsplit("/", 1)[1])
+            m = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", r.getheader("Content-Range", ""))
+            if r.status == 206 and m:
+                info["size"] = int(m.group(3))
+                if first and int(m.group(1)) == first[0] and len(data) == int(m.group(2)) - first[0] + 1:
+                    self.cache.add(key, first[0], data)
         finally:
             conn.close()
         with self.lock:
             self.meta[key] = (time.time(), info)
         return info
 
-    def fetch_span(self, host, path, headers, a, b, cancel, tries=6):
+    def fetch_span(self, host, path, headers, a, b, cancel=None, tries=6):
         """One range over its own connection.
 
         A fresh connection is sometimes throttled from the start. A span that is
@@ -568,7 +614,7 @@ class Origin:
                     raise OSError("span %d-%d: status %d" % (a, b, r.status))
                 parts, got = [], 0
                 while got < size:
-                    if cancel.is_set():
+                    if cancel is not None and cancel.is_set():
                         raise CancelledError()
                     chunk = r.read(min(65536, size - got))
                     if not chunk:
@@ -580,37 +626,67 @@ class Origin:
                         raise SlowConnection()
                 return b"".join(parts)
             except (SlowConnection, OSError, http.client.HTTPException):
-                if last:
+                if last or (cancel is not None and cancel.is_set()):
                     raise
             finally:
                 if conn:
                     conn.close()
 
+    def fetch_into_cache(self, key, headers, a, b, cancel):
+        try:
+            data = self.fetch_span(key[0], key[1], headers, a, b, cancel)
+        except CancelledError:
+            return
+        self.cache.add(key, a, data)
+
     def stream(self, host, path, headers, start, end, write):
-        """Write start..end to `write`, keeping WINDOW spans in flight."""
-        todo = spans(start, end)
-        pending = collections.deque()
+        """Write start..end to `write`.
+
+        Spans are fetched up to `ahead` bytes past the position the player has
+        read, so a slow stretch or a burst of bitrate is absorbed by memory
+        instead of reaching the player. Spans still queued when the player goes
+        away are dropped and the running ones are stopped.
+        """
+        key = (host, path)
+        pos, nxt, size = start, start, SPAN_FIRST
+        pending = []
         cancel = threading.Event()
 
-        def fill():
-            while len(pending) < WINDOW:
-                span = next(todo, None)
-                if span is None:
-                    return
-                pending.append(self.pool.submit(self.fetch_span, host, path, headers, *span, cancel))
+        def submit(a, b):
+            # The spans the player needs first skip the line behind earlier prefetching.
+            pool = self.urgent if a - start < 3 * SPAN_MAX else self.pool
+            fut = pool.submit(self.fetch_into_cache, key, headers, a, b, cancel)
+            pending.append((a, b, fut))
 
         try:
-            fill()
-            while pending:
-                data = pending.popleft().result()
-                fill()
-                write(data)
+            while pos <= end:
+                while nxt <= end and nxt - pos < self.ahead:
+                    hit = self.cache.read(key, nxt)
+                    if hit is not None:
+                        nxt += len(hit)
+                        continue
+                    stop = min(nxt + size - 1, end)
+                    size = min(size * 2, SPAN_MAX)
+                    submit(nxt, stop)
+                    nxt = stop + 1
+                chunk = self.cache.read(key, pos)
+                if chunk is None:
+                    fut = next((f for a, b, f in pending if a <= pos <= b), None)
+                    if fut is None:                       # evicted before it was read
+                        submit(pos, min(pos + SPAN_MAX - 1, end))
+                        fut = pending[-1][2]
+                    fut.result()
+                    continue
+                n = min(len(chunk), end - pos + 1)
+                write(chunk[:n])
+                pos += n
                 with self.lock:
-                    self.served += len(data)
+                    self.served += n
+                pending = [p for p in pending if p[1] >= pos]
         finally:
             cancel.set()
-            for f in pending:
-                f.cancel()
+            for _, _, fut in pending:
+                fut.cancel()
 
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -648,7 +724,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return self.reply(200, b"netmode-proxy")
         if self.path == "/stats":
             o = self.origin
-            return self.reply(200, json.dumps({"served": o.served, "since": int(o.started)}).encode(),
+            return self.reply(200, json.dumps({"served": o.served, "cached": o.cache.size, "since": int(o.started)}).encode(),
                               "application/json")
         m = re.match(r"^/([A-Za-z0-9.-]+)(/.*)$", self.path)
         if not m or not any(re.search(p, m.group(1)) for p in self.hosts):
@@ -658,7 +734,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                "Referer": "https://animelib.org/",
                "Accept": "*/*", "Accept-Encoding": "identity"}
         try:
-            info = self.origin.probe(host, path, fwd)
+            m = re.match(r"bytes=(\d+)-", self.headers.get("Range") or "")
+            first = (int(m.group(1)), int(m.group(1)) + SPAN_FIRST - 1) if m else None
+            info = self.origin.probe(host, path, fwd, first)
             if info["size"] is None:
                 return self.reply(info["status"] if info["status"] >= 400 else 502, b"origin gave no size")
             size = info["size"]
@@ -692,8 +770,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
 
 
-def make_proxy(port, hosts, scheme="https", verbose=False, origin=None):
-    handler = type("Handler", (ProxyHandler,), {"origin": origin or Origin(scheme), "hosts": hosts, "verbose": verbose})
+def make_proxy(port, hosts, scheme="https", verbose=False, origin=None, ahead=AHEAD):
+    handler = type("Handler", (ProxyHandler,), {"origin": origin or Origin(scheme, ahead), "hosts": hosts, "verbose": verbose})
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
     server.daemon_threads = True
     return server
@@ -701,7 +779,8 @@ def make_proxy(port, hosts, scheme="https", verbose=False, origin=None):
 
 def cmd_proxy(args):
     cfg = config()
-    server = make_proxy(args.port or cfg["proxy_port"], cfg["proxy_hosts"], verbose=args.verbose)
+    server = make_proxy(args.port or cfg["proxy_port"], cfg["proxy_hosts"], verbose=args.verbose,
+                        ahead=int(cfg["proxy_ahead_mb"]) << 20)
     print("netmode proxy on 127.0.0.1:%d" % server.server_address[1], file=sys.stderr)
     try:
         server.serve_forever()

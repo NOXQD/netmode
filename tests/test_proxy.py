@@ -20,6 +20,7 @@ PAYLOAD = os.urandom(5_000_000)
 class FakeVideo(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     slow_first = set()                                  # span starts served slowly once
+    hits = []                                           # (start, end) of every range asked
 
     def log_message(self, *a):
         pass
@@ -28,6 +29,7 @@ class FakeVideo(http.server.BaseHTTPRequestHandler):
         rng = self.headers.get("Range")
         a, b = rng.split("=")[1].split("-")
         a, b = int(a), min(int(b), len(PAYLOAD) - 1)
+        FakeVideo.hits.append((a, b))
         if a in self.slow_first:
             self.slow_first.discard(a)
             self.send_response(206)
@@ -46,7 +48,10 @@ class FakeVideo(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Range", "bytes %d-%d/%d" % (a, b, len(PAYLOAD)))
         self.send_header("Content-Length", str(b - a + 1))
         self.end_headers()
-        self.wfile.write(PAYLOAD[a:b + 1])
+        try:
+            self.wfile.write(PAYLOAD[a:b + 1])
+        except OSError:
+            pass
 
 
 class LocalOrigin(cli.Origin):
@@ -58,7 +63,7 @@ class LocalOrigin(cli.Origin):
         return http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
 
 
-class Proxy(unittest.TestCase):
+class ProxyCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeVideo)
@@ -84,6 +89,8 @@ class Proxy(unittest.TestCase):
         c.close()
         return r, body
 
+
+class Proxy(ProxyCase):
     def test_whole_file_without_range(self):
         r, body = self.get()
         self.assertEqual(r.status, 200)
@@ -123,6 +130,45 @@ class Proxy(unittest.TestCase):
         took = time.monotonic() - t0
         self.assertEqual(body, PAYLOAD)
         self.assertLess(took, 12, "a 1 MB span at 100 KB/s would need ~20 s without the retry")
+
+
+class Cache(ProxyCase):
+    def test_a_second_read_is_served_from_memory(self):
+        self.get("/video3.test/c.mp4", Range="bytes=0-")
+        FakeVideo.hits.clear()
+        r, body = self.get("/video3.test/c.mp4", Range="bytes=0-")
+        self.assertEqual(body, PAYLOAD)
+        self.assertEqual(FakeVideo.hits, [])
+
+    def test_prefetch_runs_ahead_of_a_slow_reader(self):
+        FakeVideo.hits.clear()
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        c.request("GET", "/video4.test/d.mp4", headers={"Range": "bytes=0-"})
+        r = c.getresponse()
+        r.read(1000)                                    # read almost nothing
+        time.sleep(1.0)
+        fetched = sum(b - a + 1 for a, b in FakeVideo.hits)
+        c.close()
+        self.assertGreater(fetched, 1_000_000)          # the proxy kept fetching on its own
+
+
+class SpanCacheTests(unittest.TestCase):
+    def test_read_returns_the_tail_of_the_segment(self):
+        c = cli.SpanCache(1000)
+        c.add("k", 100, b"abcdefghij")
+        self.assertEqual(bytes(c.read("k", 103)), b"defghij")
+        self.assertIsNone(c.read("k", 110))
+        self.assertIsNone(c.read("other", 100))
+
+    def test_least_recently_used_goes_first(self):
+        c = cli.SpanCache(25)
+        c.add("k", 0, b"a" * 10)
+        c.add("k", 10, b"b" * 10)
+        c.read("k", 0)                                  # touch the first one
+        c.add("k", 20, b"c" * 10)                       # over the limit: evicts the second
+        self.assertIsNotNone(c.read("k", 0))
+        self.assertIsNone(c.read("k", 10))
+        self.assertLessEqual(c.size, 25)
 
 
 class RangeParsing(unittest.TestCase):
