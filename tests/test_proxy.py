@@ -1,5 +1,6 @@
 import http.client
 import http.server
+import json
 import importlib.machinery
 import importlib.util
 import os
@@ -15,17 +16,38 @@ cli = importlib.util.module_from_spec(spec)
 loader.exec_module(cli)
 
 PAYLOAD = os.urandom(5_000_000)
+TOKEN = "a1" * 16
 
 
 class FakeVideo(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     slow_first = set()                                  # span starts served slowly once
     hits = []                                           # (start, end) of every range asked
+    referers = []
 
     def log_message(self, *a):
         pass
 
     def do_GET(self):
+        FakeVideo.referers.append(self.headers.get("Referer"))
+        if self.path.startswith("//noranges") or self.path.startswith("/noranges"):
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(len(PAYLOAD)))
+            self.end_headers()
+            self.wfile.write(PAYLOAD)
+            return
+        if "missing" in self.path:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if "moved" in self.path:
+            self.send_response(302)
+            self.send_header("Location", "https://example.org/real.mp4")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         rng = self.headers.get("Range")
         a, b = rng.split("=")[1].split("-")
         a, b = int(a), min(int(b), len(PAYLOAD) - 1)
@@ -70,7 +92,9 @@ class ProxyCase(unittest.TestCase):
         origin.daemon_threads = True
         threading.Thread(target=origin.serve_forever, daemon=True).start()
         cls.origin_srv = origin
-        cls.proxy = cli.make_proxy(0, [r"^video\d*\.test$"], origin=LocalOrigin(origin.server_address[1]))
+        cls.proxy = cli.make_proxy(
+            0, TOKEN, origin=LocalOrigin(origin.server_address[1]), exclude=[r"^excluded\.test$"],
+            referers=[[r"^ref\.test$", "https://ref.example/"]], check_host=lambda h: h != "private.test")
         threading.Thread(target=cls.proxy.serve_forever, daemon=True).start()
         cls.port = cls.proxy.server_address[1]
 
@@ -82,6 +106,8 @@ class ProxyCase(unittest.TestCase):
         cls.origin_srv.server_close()
 
     def get(self, path="/video1.test/a/b.mp4", method="GET", **headers):
+        if not path.startswith("/ping") and not path.startswith("/bypass") and not path.startswith("/stats"):
+            path = "/" + TOKEN + path
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
         c.request(method, path, headers=headers)
         r = c.getresponse()
@@ -117,11 +143,52 @@ class Proxy(ProxyCase):
         r, _ = self.get(Range="bytes=9000000-")
         self.assertEqual(r.status, 416)
 
-    def test_only_listed_hosts(self):
-        r, _ = self.get("/example.com/a.mp4")
-        self.assertEqual(r.status, 403)
+    def test_wrong_token_is_refused(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("GET", "/" + "b2" * 16 + "/video1.test/a.mp4", headers={"Range": "bytes=0-"})
+        self.assertEqual(c.getresponse().status, 403)
+        c.close()
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("GET", "/video1.test/a.mp4")
+        self.assertEqual(c.getresponse().status, 403)
+        c.close()
+
+    def test_ping(self):
         r, body = self.get("/ping")
         self.assertEqual(body, b"netmode-proxy")
+
+    def bypassed(self):
+        return json.loads(self.get("/bypass")[1])
+
+    def test_private_and_excluded_hosts_are_refused_and_listed(self):
+        self.assertEqual(self.get("/private.test/a.mp4", Range="bytes=0-")[0].status, 403)
+        self.assertEqual(self.get("/excluded.test/a.mp4", Range="bytes=0-")[0].status, 403)
+        self.assertLessEqual({"private.test", "excluded.test"}, set(self.bypassed()))
+
+    def test_a_server_without_ranges_is_relayed_and_bypassed(self):
+        r, body = self.get("/norange.test/noranges.mp4", Range="bytes=100-")
+        self.assertEqual(r.status, 200)
+        self.assertEqual(body, PAYLOAD)
+        self.assertIn("norange.test", self.bypassed())
+
+    def test_errors_are_relayed_and_bypassed(self):
+        r, _ = self.get("/gone.test/missing.mp4", Range="bytes=0-")
+        self.assertEqual(r.status, 404)
+        self.assertIn("gone.test", self.bypassed())
+
+    def test_redirects_are_relayed_without_bypass(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("GET", "/" + TOKEN + "/hop.test/moved.mp4", headers={"Range": "bytes=0-"})
+        r = c.getresponse()
+        r.read()
+        self.assertEqual((r.status, r.getheader("Location")), (302, "https://example.org/real.mp4"))
+        self.assertNotIn("hop.test", self.bypassed())
+
+    def test_referer_comes_from_the_config_not_the_page(self):
+        FakeVideo.referers.clear()
+        self.get("/ref.test/r.mp4", Range="bytes=0-99", Referer="https://evil.example/")
+        self.get("/video9.test/r.mp4", Range="bytes=0-99")
+        self.assertEqual(FakeVideo.referers, ["https://ref.example/", None])
 
     def test_a_throttled_connection_is_replaced(self):
         FakeVideo.slow_first.add(1 << 20)               # the second span starts slow
@@ -143,7 +210,7 @@ class Cache(ProxyCase):
     def test_prefetch_runs_ahead_of_a_slow_reader(self):
         FakeVideo.hits.clear()
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
-        c.request("GET", "/video4.test/d.mp4", headers={"Range": "bytes=0-"})
+        c.request("GET", "/" + TOKEN + "/video4.test/d.mp4", headers={"Range": "bytes=0-"})
         r = c.getresponse()
         r.read(1000)                                    # read almost nothing
         time.sleep(1.0)
