@@ -85,6 +85,7 @@ class Downloader(unittest.TestCase):
         handler = type("H", (RangeHandler,), {"ranges": ranges})
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
         self.addCleanup(srv.shutdown)
         return "http://127.0.0.1:%d/file.bin" % srv.server_address[1]
 

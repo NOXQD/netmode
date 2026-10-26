@@ -9,11 +9,14 @@
     netmode get URL [-n N]      segmented multi-connection download
     netmode auto [on|off]       auto-switch to video while AnimeLib is open
     netmode keepalive           keep the Wi-Fi link awake (100 tiny packets/s)
+    netmode proxy               local accelerator for the AnimeLib video server
     netmode watch               the daemon behind `auto`
 """
 import argparse
+import collections
 import concurrent.futures as cf
 import http.client
+import http.server
 import json
 import os
 import random
@@ -21,6 +24,7 @@ import re
 import shutil
 import socket
 import statistics
+import ssl
 import struct
 import subprocess
 import sys
@@ -40,6 +44,8 @@ DEFAULT_CONFIG = {
     "auto_video": True,
     "patterns": [r"anime\s?lib", r"anilib"],
     "browsers": ["chromium", "chrome", "brave", "vivaldi", "firefox", "zen", "opera"],
+    "proxy_port": 18765,
+    "proxy_hosts": [r"^video\d*\.cdnlibs\.org$"],
 }
 
 
@@ -203,6 +209,7 @@ def snapshot(deep=False):
         "gateway": gw_ping,
         "internet": net_ping,
         "auto": config()["auto_video"],
+        "proxy": proxy_stats(),
         "bench": load_json(BENCH_FILE, None),
     }
 
@@ -451,6 +458,266 @@ def cmd_keepalive(args):
             nxt = time.monotonic()
 
 
+# ---------------------------------------------------------------- video proxy
+#
+# The AnimeLib video servers give every TCP connection a fast start (tens of
+# Mbit/s for ~10 s) and then cut it to 3-6 Mbit/s. A browser plays a file over
+# one long connection, so 4K runs out of buffer every few seconds. This proxy
+# answers the player on localhost and fetches the bytes from the server in short
+# ranges over fresh connections, six at a time: ~120 Mbit/s sustained in tests.
+
+SPAN_FIRST = 1 << 20
+SPAN_MAX = 8 << 20
+WINDOW = 6
+
+
+def spans(start, end):
+    """Byte ranges to fetch for start..end: small first, so playback begins fast."""
+    size = SPAN_FIRST
+    while start <= end:
+        stop = min(start + size - 1, end)
+        yield start, stop
+        start = stop + 1
+        size = min(size * 2, SPAN_MAX)
+
+
+def parse_range(header, total):
+    """Return (start, end) inclusive for a single-range header, or None if unsatisfiable."""
+    if not header:
+        return 0, total - 1
+    m = re.fullmatch(r"bytes=(\d*)-(\d*)", header.strip())
+    if not m or (not m.group(1) and not m.group(2)):
+        return 0, total - 1
+    if not m.group(1):                                   # suffix: last N bytes
+        n = int(m.group(2))
+        return max(total - n, 0), total - 1
+    start = int(m.group(1))
+    end = min(int(m.group(2)), total - 1) if m.group(2) else total - 1
+    return (start, end) if start <= end and start < total else None
+
+
+class CancelledError(Exception):
+    pass
+
+
+class SlowConnection(Exception):
+    pass
+
+
+class Origin:
+    """Short-lived connections to the video hosts, with a small size cache."""
+
+    def __init__(self, scheme="https"):
+        self.scheme = scheme
+        self.pool = cf.ThreadPoolExecutor(max_workers=16)
+        self.meta = {}
+        self.lock = threading.Lock()
+        self.served = 0
+        self.started = time.time()
+
+    def connect(self, host):
+        if self.scheme == "https":
+            return http.client.HTTPSConnection(host, timeout=15, context=ssl.create_default_context())
+        return http.client.HTTPConnection(host, timeout=15)
+
+    def get(self, host, path, headers, byte_range=None):
+        conn = self.connect(host)
+        hdr = dict(headers, Connection="close")
+        if byte_range:
+            hdr["Range"] = "bytes=%d-%d" % byte_range
+        conn.request("GET", path, headers=hdr)
+        return conn, conn.getresponse()
+
+    def probe(self, host, path, headers):
+        """(status, info) where info has size, type and validators; cached for ten minutes."""
+        key = (host, path)
+        with self.lock:
+            hit = self.meta.get(key)
+        if hit and time.time() - hit[0] < 600:
+            return hit[1]
+        conn, r = self.get(host, path, headers, (0, 0))
+        try:
+            r.read()
+            info = {"status": r.status, "type": r.getheader("Content-Type", "video/mp4"),
+                    "etag": r.getheader("ETag"), "modified": r.getheader("Last-Modified"),
+                    "size": None}
+            cr = r.getheader("Content-Range", "")
+            if r.status == 206 and "/" in cr and cr.rsplit("/", 1)[1].isdigit():
+                info["size"] = int(cr.rsplit("/", 1)[1])
+        finally:
+            conn.close()
+        with self.lock:
+            self.meta[key] = (time.time(), info)
+        return info
+
+    def fetch_span(self, host, path, headers, a, b, cancel, tries=6):
+        """One range over its own connection.
+
+        A fresh connection is sometimes throttled from the start. A span that is
+        far behind schedule is dropped and fetched again on a new connection;
+        the last try is never dropped.
+        """
+        size = b - a + 1
+        for attempt in range(tries):
+            conn = None
+            last = attempt == tries - 1
+            try:
+                t0 = time.monotonic()
+                conn, r = self.get(host, path, headers, (a, b))
+                if r.status != 206:
+                    raise OSError("span %d-%d: status %d" % (a, b, r.status))
+                parts, got = [], 0
+                while got < size:
+                    if cancel.is_set():
+                        raise CancelledError()
+                    chunk = r.read(min(65536, size - got))
+                    if not chunk:
+                        raise OSError("span %d-%d: short read" % (a, b))
+                    parts.append(chunk)
+                    got += len(chunk)
+                    elapsed = time.monotonic() - t0
+                    if not last and elapsed > 2.5 and got < size * (elapsed - 1.0) / 6:
+                        raise SlowConnection()
+                return b"".join(parts)
+            except (SlowConnection, OSError, http.client.HTTPException):
+                if last:
+                    raise
+            finally:
+                if conn:
+                    conn.close()
+
+    def stream(self, host, path, headers, start, end, write):
+        """Write start..end to `write`, keeping WINDOW spans in flight."""
+        todo = spans(start, end)
+        pending = collections.deque()
+        cancel = threading.Event()
+
+        def fill():
+            while len(pending) < WINDOW:
+                span = next(todo, None)
+                if span is None:
+                    return
+                pending.append(self.pool.submit(self.fetch_span, host, path, headers, *span, cancel))
+
+        try:
+            fill()
+            while pending:
+                data = pending.popleft().result()
+                fill()
+                write(data)
+                with self.lock:
+                    self.served += len(data)
+        finally:
+            cancel.set()
+            for f in pending:
+                f.cancel()
+
+
+class ProxyHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    origin = None
+    hosts = []
+    verbose = False
+
+    def log_message(self, fmt, *args):
+        if self.verbose:
+            sys.stderr.write("%s\n" % (fmt % args))
+
+    def cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges")
+
+    def reply(self, code, body=b"", ctype="text/plain"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.cors()
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.reply(204)
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        if self.path == "/ping":
+            return self.reply(200, b"netmode-proxy")
+        if self.path == "/stats":
+            o = self.origin
+            return self.reply(200, json.dumps({"served": o.served, "since": int(o.started)}).encode(),
+                              "application/json")
+        m = re.match(r"^/([A-Za-z0-9.-]+)(/.*)$", self.path)
+        if not m or not any(re.search(p, m.group(1)) for p in self.hosts):
+            return self.reply(403, b"host not allowed")
+        host, path = m.groups()
+        fwd = {"User-Agent": self.headers.get("User-Agent", "Mozilla/5.0"),
+               "Referer": "https://animelib.org/",
+               "Accept": "*/*", "Accept-Encoding": "identity"}
+        try:
+            info = self.origin.probe(host, path, fwd)
+            if info["size"] is None:
+                return self.reply(info["status"] if info["status"] >= 400 else 502, b"origin gave no size")
+            size = info["size"]
+            rng = parse_range(self.headers.get("Range"), size)
+            if rng is None:
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % size)
+                self.send_header("Content-Length", "0")
+                self.cors()
+                self.end_headers()
+                return
+            start, end = rng
+            partial = bool(self.headers.get("Range"))
+            self.send_response(206 if partial else 200)
+            self.send_header("Content-Type", info["type"])
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(end - start + 1))
+            if partial:
+                self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+            for k, v in (("ETag", info["etag"]), ("Last-Modified", info["modified"])):
+                if v:
+                    self.send_header(k, v)
+            self.cors()
+            self.end_headers()
+            if self.command != "HEAD":
+                self.origin.stream(host, path, fwd, start, end, self.wfile.write)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True                   # the player stopped reading
+        except (OSError, http.client.HTTPException) as e:
+            sys.stderr.write("proxy: %s%s: %s\n" % (host, path[:60], e))
+            self.close_connection = True
+
+
+def make_proxy(port, hosts, scheme="https", verbose=False, origin=None):
+    handler = type("Handler", (ProxyHandler,), {"origin": origin or Origin(scheme), "hosts": hosts, "verbose": verbose})
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+    server.daemon_threads = True
+    return server
+
+
+def cmd_proxy(args):
+    cfg = config()
+    server = make_proxy(args.port or cfg["proxy_port"], cfg["proxy_hosts"], verbose=args.verbose)
+    print("netmode proxy on 127.0.0.1:%d" % server.server_address[1], file=sys.stderr)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def proxy_stats():
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/stats" % config()["proxy_port"], timeout=0.4) as r:
+            return json.loads(r.read())
+    except (OSError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------- auto mode
 
 def video_window_open(cfg):
@@ -549,6 +816,7 @@ def cmd_status(args):
     print("DNS         %s" % snap["dns"])
     print("TCP         %s" % snap["cc"])
     print("авто-видео  %s" % ("вкл" if snap["auto"] else "выкл"))
+    print("ускоритель  %s" % ("работает, отдано %.0f МБ" % (snap["proxy"]["served"] / 1e6) if snap["proxy"] else "не запущен"))
     return 0
 
 
@@ -613,6 +881,10 @@ def main(argv=None):
     s = sub.add_parser("auto")
     s.add_argument("state", nargs="?", choices=["on", "off"])
     s.set_defaults(fn=cmd_auto)
+    s = sub.add_parser("proxy")
+    s.add_argument("--port", type=int)
+    s.add_argument("-v", "--verbose", action="store_true")
+    s.set_defaults(fn=cmd_proxy)
     s = sub.add_parser("keepalive")
     s.add_argument("--hz", type=float, default=100)
     s.set_defaults(fn=cmd_keepalive)
