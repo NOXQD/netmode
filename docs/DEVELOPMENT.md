@@ -6,6 +6,7 @@ root/install-root.sh       корневая часть установки
 root/dev.noxqd.netmode.policy  действие polkit (запасной путь, если нет sudoers)
 bin/netmode                CLI, замеры, загрузчик, демон авто-видео
 plugin/                    QML-плагин панели Omarchy
+extension/                 расширение Chromium: перенаправляет видеозапросы на прокси
 tests/                     unittest
 ```
 
@@ -23,6 +24,21 @@ QT_QPA_PLATFORM=offscreen quickshell -p путь/к/shell.qml
 `modeList`, `snap`, `pulse` и `benchResult`; `Commons` и `Ui` берутся
 символическими ссылками из `/usr/share/omarchy/shell`. Так сделаны картинки в
 `docs/screenshots`.
+
+## Проверка ускорителя без своего браузера
+
+Прокси можно запустить командой `netmode proxy -v` и забрать кусок напрямую:
+
+```bash
+curl -r 5000000-5999999 http://127.0.0.1:18765/video2.cdnlibs.org//uploads/…/1983_2160.mp4
+```
+
+Для сквозной проверки нужен отдельный Chromium с чистым профилем
+(`--headless=new --user-data-dir=… --load-extension=extension`), страница по
+HTTPS и самоподписанный сертификат с `--ignore-certificate-errors`. Правило
+перенаправления ставится после старта сервис-воркера, поэтому `<video>`
+лучше создавать с задержкой в несколько секунд. Расширению нужны хост-права
+не только на видеосервер, но и на страницу-инициатор.
 
 ## Добавить режим
 
