@@ -44,6 +44,7 @@ function stats(snap, keepalive) {
   rows.push({ k: "Роутер", v: ping(snap.gateway) })
   rows.push({ k: "Интернет", v: ping(snap.internet) + "  · " + quality(snap.internet) })
   rows.push({ k: "DNS", v: dnsName(snap.dns) })
+  rows.push({ k: "Ускоритель", v: snap.proxy ? "работает  ·  отдано " + Math.round(snap.proxy.served / 1e6) + " МБ" : "не запущен" })
   if (keepalive) rows.push({ k: "Wi-Fi", v: "не засыпает  ·  100 пак/с" })
   return rows
 }
@@ -51,7 +52,7 @@ function stats(snap, keepalive) {
 function benchRows(b) {
   if (!b) return []
   var rows = []
-  rows.push({ k: "Скачивание", v: mbit(b.down_1) + "  ·  4 потока " + mbit(b.down_4) })
+  rows.push({ k: "Скачивание", v: Math.round(b.down_1) + " / " + mbit(b.down_4) + "  (1 и 4 потока)" })
   rows.push({ k: "Под нагрузкой", v: ping(b.loaded) })
   rows.push({ k: "DNS-запрос", v: "кэш " + ms(b.dns.cached_ms) + "  ·  без кэша " + ms(b.dns.miss_ms) })
   return rows
