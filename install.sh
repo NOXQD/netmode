@@ -42,6 +42,9 @@ chmod 644 "$plugin_dir/Env.js"
 ext_dir=$HOME/.local/share/netmode/extension
 install -d "$ext_dir"
 install -m 644 "$here"/extension/manifest.json "$here"/extension/background.js "$ext_dir/"
+port=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("proxy_port", 18765))' "$HOME/.config/netmode/config.json" 2>/dev/null || echo 18765)
+printf 'const PORT = %s\nconst TOKEN = "%s"\n' "$port" "$("$exe" token)" >"$ext_dir/token.js"
+chmod 600 "$ext_dir/token.js"
 
 # Chromium reads its flags once at start; the extension is picked up on the next launch.
 flags=$HOME/.config/chromium-flags.conf
