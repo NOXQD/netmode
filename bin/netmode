@@ -1,0 +1,630 @@
+#!/usr/bin/env python3
+"""netmode: network profiles (video / gaming / download) for Omarchy.
+
+    netmode                     current mode and link status
+    netmode set MODE            balanced | video | gaming | download
+    netmode modes               list the modes
+    netmode pulse               one line of JSON for the bar widget
+    netmode bench               latency, jitter and throughput test
+    netmode get URL [-n N]      segmented multi-connection download
+    netmode auto [on|off]       auto-switch to video while AnimeLib is open
+    netmode keepalive           keep the Wi-Fi link awake (100 tiny packets/s)
+    netmode watch               the daemon behind `auto`
+"""
+import argparse
+import concurrent.futures as cf
+import http.client
+import json
+import os
+import random
+import re
+import shutil
+import socket
+import statistics
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+HELPER = "/usr/local/lib/netmode/netmode-root"
+RUNTIME_STATE = "/run/netmode/state.json"
+CONFIG_DIR = os.path.expanduser("~/.config/netmode")
+CONFIG_FILE = CONFIG_DIR + "/config.json"
+STATE_DIR = os.path.expanduser("~/.local/state/netmode")
+BENCH_FILE = STATE_DIR + "/bench.json"
+
+DEFAULT_CONFIG = {
+    "auto_video": True,
+    "patterns": [r"anime\s?lib", r"anilib"],
+    "browsers": ["chromium", "chrome", "brave", "vivaldi", "firefox", "zen", "opera"],
+}
+
+
+# ---------------------------------------------------------------- helpers
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def config():
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(load_json(CONFIG_FILE, {}))
+    return cfg
+
+
+def out(cmd, timeout=5):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def helper_json(*args):
+    if not os.path.exists(HELPER):
+        return None
+    try:
+        return json.loads(out([HELPER, *args]))
+    except ValueError:
+        return None
+
+
+def modes():
+    return helper_json("list") or []
+
+
+def current_mode():
+    state = load_json(RUNTIME_STATE, None)
+    if state and state.get("mode"):
+        return state["mode"]
+    return "balanced"
+
+
+def notify(title, body="", glyph=""):
+    if shutil.which("omarchy-notification-send"):
+        cmd = ["omarchy-notification-send", "--app-name", "netmode"]
+        if glyph:
+            cmd += ["-g", glyph]
+        subprocess.run(cmd + [title, body], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def escalate(argv):
+    """Run the helper as root: directly, via a sudoers grant, or via polkit."""
+    if os.geteuid() == 0:
+        return subprocess.run(argv).returncode
+    if shutil.which("sudo"):
+        r = subprocess.run(["sudo", "-n", *argv], capture_output=True, text=True)
+        if r.returncode == 0:
+            return 0
+    if shutil.which("pkexec"):
+        return subprocess.run(["pkexec", *argv]).returncode
+    return 1
+
+
+def set_mode(mode, quiet=False):
+    known = {m["id"]: m for m in modes()}
+    if not known:
+        print("netmode: helper is not installed, run ./install.sh", file=sys.stderr)
+        return 1
+    if mode not in known:
+        print("netmode: unknown mode %r (%s)" % (mode, ", ".join(known)), file=sys.stderr)
+        return 2
+    rc = escalate([HELPER, "apply", mode])
+    if rc != 0:
+        print("netmode: could not apply %s (exit %d)" % (mode, rc), file=sys.stderr)
+        return rc
+    if not quiet:
+        m = known[mode]
+        notify("Сеть: " + m["name"], m["blurb"], m["icon"])
+    return 0
+
+
+# ---------------------------------------------------------------- link info
+
+def wifi_iface():
+    base = "/sys/class/net"
+    for name in sorted(os.listdir(base)):
+        if os.path.isdir("%s/%s/wireless" % (base, name)):
+            return name
+    return None
+
+
+def wifi_info():
+    iface = wifi_iface()
+    if not iface:
+        return None
+    text = out(["iw", "dev", iface, "link"])
+    if "Not connected" in text or not text.strip():
+        return {"iface": iface, "connected": False}
+    info = {"iface": iface, "connected": True}
+    for key, rx in (("ssid", r"SSID: (.+)"), ("signal", r"signal: (-?\d+)"),
+                    ("freq", r"freq: (\d+)"), ("rx", r"rx bitrate: ([\d.]+)"),
+                    ("tx", r"tx bitrate: ([\d.]+)")):
+        m = re.search(rx, text)
+        if m:
+            v = m.group(1)
+            info[key] = v if key == "ssid" else float(v)
+    return info
+
+
+def default_gateway():
+    m = re.search(r"default via (\S+)", out(["ip", "route", "show", "default"]))
+    return m.group(1) if m else None
+
+
+def dns_servers():
+    m = re.search(r"Current DNS Server: (\S+)", out(["resolvectl", "status"]))
+    return m.group(1) if m else None
+
+
+def ping(host, count=4, interval=0.2):
+    """Return {avg,min,max,jitter,loss} in ms for host, or None."""
+    if not host:
+        return None
+    text = out(["ping", "-c", str(count), "-i", str(interval), "-W", "1", "-q", host],
+               timeout=count * (interval + 1) + 3)
+    m = re.search(r"= ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+) ms", text)
+    loss = re.search(r"([\d.]+)% packet loss", text)
+    if not m:
+        return {"loss": 100.0} if loss else None
+    lo, avg, hi, mdev = (float(x) for x in m.groups())
+    return {"min": lo, "avg": avg, "max": hi, "jitter": mdev,
+            "loss": float(loss.group(1)) if loss else 0.0}
+
+
+def snapshot(deep=False):
+    gw = default_gateway()
+    count, interval = (20, 0.1) if deep else (3, 0.2)
+    with cf.ThreadPoolExecutor(2) as pool:
+        f_gw = pool.submit(ping, gw, count, interval)
+        f_net = pool.submit(ping, "1.1.1.1", count, interval)
+        gw_ping, net_ping = f_gw.result(), f_net.result()
+    return {
+        "mode": current_mode(),
+        "cc": open("/proc/sys/net/ipv4/tcp_congestion_control").read().strip(),
+        "dns": dns_servers(),
+        "wifi": wifi_info(),
+        "gateway": gw_ping,
+        "internet": net_ping,
+        "auto": config()["auto_video"],
+        "bench": load_json(BENCH_FILE, None),
+    }
+
+
+# ---------------------------------------------------------------- bench
+
+def dns_probe(server, name, timeout=2.0):
+    tid = random.randint(0, 65535)
+    q = b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\0"
+    pkt = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0) + q + struct.pack(">HH", 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    t0 = time.perf_counter()
+    try:
+        s.sendto(pkt, (server, 53))
+        s.recvfrom(1500)
+        return (time.perf_counter() - t0) * 1000
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def bench_dns():
+    """Cached vs. uncached lookup time through the system stub resolver."""
+    stub = "127.0.0.53"
+    cached = [dns_probe(stub, "cloudflare.com") for _ in range(6)][1:]
+    cached = [x for x in cached if x is not None]
+    miss = [dns_probe(stub, "n%06d.cloudflare.com" % random.randint(0, 999999)) for _ in range(5)]
+    miss = [x for x in miss if x is not None]
+    return {
+        "cached_ms": round(min(cached), 1) if cached else None,
+        "miss_ms": round(statistics.median(miss), 1) if miss else None,
+    }
+
+
+def stream_bytes(deadline, counter, lock):
+    """Pull from Cloudflare's speed endpoint until the deadline."""
+    try:
+        conn = http.client.HTTPSConnection("speed.cloudflare.com", timeout=8)
+        while time.monotonic() < deadline:
+            conn.request("GET", "/__down?bytes=50000000", headers={"User-Agent": "netmode"})
+            resp = conn.getresponse()
+            if resp.status != 200:
+                return
+            while time.monotonic() < deadline:
+                chunk = resp.read(262144)
+                if not chunk:
+                    break
+                with lock:
+                    counter[0] += len(chunk)
+            if time.monotonic() >= deadline:
+                conn.close()
+                return
+    except OSError:
+        return
+
+
+def throughput(streams, seconds=4.0):
+    counter, lock = [0], threading.Lock()
+    t0 = time.monotonic()
+    deadline = t0 + seconds
+    threads = [threading.Thread(target=stream_bytes, args=(deadline, counter, lock))
+               for _ in range(streams)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    elapsed = max(time.monotonic() - t0, 0.001)
+    return round(counter[0] * 8 / elapsed / 1e6, 1)
+
+
+def bench(progress=None):
+    step = progress or (lambda s: None)
+    result = {"when": int(time.time()), "mode": current_mode()}
+    step("dns")
+    result["dns"] = bench_dns()
+    step("latency")
+    result["gateway"] = ping(default_gateway(), 30, 0.1)
+    result["internet"] = ping("1.1.1.1", 30, 0.1)
+    step("down1")
+    result["down_1"] = throughput(1)
+    step("down4")
+    with cf.ThreadPoolExecutor(1) as pool:
+        loaded = pool.submit(ping, "1.1.1.1", 25, 0.15)
+        result["down_4"] = throughput(4, 4.5)
+        result["loaded"] = loaded.result()
+    save_json(BENCH_FILE, result)
+    return result
+
+
+def fmt_ping(p):
+    if not p or "avg" not in p:
+        return "—"
+    return "%.1f мс (джиттер %.1f, макс %.0f, потери %g%%)" % (p["avg"], p["jitter"], p["max"], p["loss"])
+
+
+def print_bench(r):
+    print("режим        %s" % r["mode"])
+    print("DNS          кэш %s мс, без кэша %s мс" % (r["dns"]["cached_ms"], r["dns"]["miss_ms"]))
+    print("роутер       %s" % fmt_ping(r["gateway"]))
+    print("интернет     %s" % fmt_ping(r["internet"]))
+    print("под нагрузкой %s" % fmt_ping(r["loaded"]))
+    print("скачивание   1 поток %s Мбит/с, 4 потока %s Мбит/с" % (r["down_1"], r["down_4"]))
+
+
+# ---------------------------------------------------------------- downloader
+
+class Progress:
+    def __init__(self, total):
+        self.total, self.done, self.lock = total, 0, threading.Lock()
+        self.t0 = time.monotonic()
+
+    def add(self, n):
+        with self.lock:
+            self.done += n
+
+    def line(self):
+        el = max(time.monotonic() - self.t0, 0.001)
+        rate = self.done / el
+        pct = " %3d%%" % (100 * self.done // self.total) if self.total else ""
+        return "\r%7.1f МБ  %6.1f МБ/с%s " % (self.done / 1e6, rate / 1e6, pct)
+
+
+def probe(url):
+    """Return (final_url, size or None, ranges_ok)."""
+    req = urllib.request.Request(url, headers={"Range": "bytes=0-0", "User-Agent": "netmode"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        final = r.geturl()
+        cr = r.headers.get("Content-Range")
+        if r.status == 206 and cr and "/" in cr and cr.rsplit("/", 1)[1].isdigit():
+            return final, int(cr.rsplit("/", 1)[1]), True
+        length = r.headers.get("Content-Length")
+        return final, int(length) if length and length.isdigit() else None, False
+
+
+def fetch_range(parts, start, end, fd, prog, tries=6):
+    for attempt in range(tries):
+        conn, pos = None, start
+        try:
+            cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+            conn = cls(parts.netloc, timeout=20)
+            path = parts.path or "/"
+            if parts.query:
+                path += "?" + parts.query
+            conn.request("GET", path, headers={"Range": "bytes=%d-%d" % (start, end),
+                                               "User-Agent": "netmode"})
+            r = conn.getresponse()
+            if r.status != 206:
+                raise OSError("server answered %d" % r.status)
+            while pos <= end:
+                chunk = r.read(min(262144, end - pos + 1))
+                if not chunk:
+                    raise OSError("short read")
+                os.pwrite(fd, chunk, pos)
+                pos += len(chunk)
+                prog.add(len(chunk))
+            return
+        except OSError:
+            prog.add(-(pos - start))
+            time.sleep(min(2 ** attempt * 0.25, 4))
+        finally:
+            if conn:
+                conn.close()
+    raise OSError("range %d-%d failed" % (start, end))
+
+
+def cmd_get(args):
+    url = args.url
+    final, size, ranges = probe(url)
+    name = args.output or os.path.basename(urllib.parse.urlsplit(final).path) or "download"
+    parts = urllib.parse.urlsplit(final)
+    n = max(1, args.connections)
+    if not (size and ranges):
+        print("сервер не поддерживает докачку по частям, качаю одним потоком", file=sys.stderr)
+        n = 1
+    part = name + ".part"
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    prog = Progress(size)
+    stop = threading.Event()
+
+    def ticker():
+        while not stop.wait(0.25):
+            sys.stderr.write(prog.line())
+            sys.stderr.flush()
+
+    threading.Thread(target=ticker, daemon=True).start()
+    try:
+        if size and ranges:
+            os.ftruncate(fd, size)
+            chunk = max(1 << 20, size // (n * 6))
+            spans = [(s, min(s + chunk, size) - 1) for s in range(0, size, chunk)]
+            with cf.ThreadPoolExecutor(n) as pool:
+                for fut in [pool.submit(fetch_range, parts, a, b, fd, prog) for a, b in spans]:
+                    fut.result()
+        else:
+            with urllib.request.urlopen(urllib.request.Request(final, headers={"User-Agent": "netmode"})) as r:
+                while True:
+                    buf = r.read(262144)
+                    if not buf:
+                        break
+                    os.write(fd, buf)
+                    prog.add(len(buf))
+    finally:
+        stop.set()
+        os.close(fd)
+    os.replace(part, name)
+    sys.stderr.write(prog.line() + "\n")
+    print(name)
+    return 0
+
+
+# ---------------------------------------------------------------- keepalive
+
+def cmd_keepalive(args):
+    """Send a tiny UDP packet to the router hz times a second.
+
+    An idle Wi-Fi link here wakes up with 100-200 ms latency spikes. A steady
+    trickle of packets keeps the radio and the router's queue awake: measured
+    on this machine, 0 spikes over 20 ms in 150 pings at 100 Hz against 7-17
+    without. It costs ~6 KB/s and a little power, so it is only on in the
+    performance modes.
+    """
+    period = 1.0 / args.hz
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    gateway, checked = None, 0.0
+    nxt = time.monotonic()
+    while True:
+        now = time.monotonic()
+        if now - checked > 5:
+            gateway, checked = default_gateway(), now
+        if not gateway:
+            time.sleep(2)
+            checked = 0.0
+            nxt = time.monotonic()
+            continue
+        try:
+            sock.sendto(b"k", (gateway, 9))
+        except OSError:
+            time.sleep(1)
+        nxt += period
+        delay = nxt - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        elif delay < -1:
+            nxt = time.monotonic()
+
+
+# ---------------------------------------------------------------- auto mode
+
+def video_window_open(cfg):
+    try:
+        clients = json.loads(out(["hyprctl", "clients", "-j"]))
+    except ValueError:
+        return False
+    pats = [re.compile(p, re.I) for p in cfg["patterns"]]
+    for c in clients:
+        cls = (c.get("class") or "").lower()
+        if any(b in cls for b in cfg["browsers"]) and any(p.search(c.get("title") or "") for p in pats):
+            return True
+    return False
+
+
+def hypr_events():
+    """Yield once per Hyprland event; fall back to a 3 s tick if there is no socket."""
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    rt = os.environ.get("XDG_RUNTIME_DIR")
+    path = "%s/hypr/%s/.socket2.sock" % (rt, sig) if sig and rt else None
+    while True:
+        if path and os.path.exists(path):
+            s = socket.socket(socket.AF_UNIX)
+            try:
+                s.connect(path)
+                s.settimeout(3)
+                buf = b""
+                while True:
+                    try:
+                        data = s.recv(4096)
+                        if not data:
+                            break
+                        buf += data
+                        lines = buf.split(b"\n")
+                        buf = lines.pop()
+                        if any(l.split(b">>")[0] in (b"openwindow", b"closewindow", b"windowtitlev2", b"windowtitle")
+                               for l in lines):
+                            yield
+                    except socket.timeout:
+                        yield
+            except OSError:
+                pass
+            finally:
+                s.close()
+        time.sleep(3)
+        yield
+
+
+def cmd_watch(_args):
+    """Switch to video while a browser window shows AnimeLib, then put the old mode back."""
+    previous, owned, suppressed = None, False, False
+    last_check = 0.0
+    for _ in hypr_events():
+        if time.monotonic() - last_check < 1.0:
+            continue
+        last_check = time.monotonic()
+        cfg = config()
+        want = cfg["auto_video"] and video_window_open(cfg)
+        now = current_mode()
+        if want and not owned and not suppressed and now != "video":
+            previous = now
+            if set_mode("video") == 0:
+                owned = True
+        elif want and owned and now != "video":
+            owned, suppressed = False, True      # user picked another mode: leave it alone
+        elif not want:
+            if owned and now == "video":
+                set_mode(previous or "balanced")
+            owned, suppressed = False, False
+
+
+def cmd_auto(args):
+    cfg = load_json(CONFIG_FILE, {})
+    if args.state in ("on", "off"):
+        cfg["auto_video"] = args.state == "on"
+        save_json(CONFIG_FILE, cfg)
+    print("on" if config()["auto_video"] else "off")
+    return 0
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_status(args):
+    snap = snapshot(deep=args.deep)
+    snap["modes"] = modes()
+    if args.json:
+        print(json.dumps(snap, ensure_ascii=False))
+        return 0
+    names = {m["id"]: m["name"] for m in snap["modes"]}
+    print("режим       %s" % names.get(snap["mode"], snap["mode"]))
+    w = snap["wifi"]
+    if w and w.get("connected"):
+        print("wi-fi       %s  %g dBm  ↓%g ↑%g Мбит/с" % (w.get("ssid"), w.get("signal", 0), w.get("rx", 0), w.get("tx", 0)))
+    print("роутер      %s" % fmt_ping(snap["gateway"]))
+    print("интернет    %s" % fmt_ping(snap["internet"]))
+    print("DNS         %s" % snap["dns"])
+    print("TCP         %s" % snap["cc"])
+    print("авто-видео  %s" % ("вкл" if snap["auto"] else "выкл"))
+    return 0
+
+
+def cmd_pulse(_args):
+    snap = snapshot()
+    w = snap["wifi"] or {}
+    print(json.dumps({
+        "mode": snap["mode"],
+        "rtt": (snap["internet"] or {}).get("avg"),
+        "loss": (snap["internet"] or {}).get("loss"),
+        "signal": w.get("signal"),
+        "rate": w.get("rx"),
+    }))
+    return 0
+
+
+def cmd_modes(args):
+    ms = modes()
+    if args.json:
+        print(json.dumps(ms, ensure_ascii=False))
+    else:
+        cur = current_mode()
+        for m in ms:
+            print("%s %-9s %-9s %s" % ("●" if m["id"] == cur else " ", m["id"], m["name"], m["blurb"]))
+    return 0
+
+
+def cmd_bench(args):
+    labels = {"dns": "DNS", "latency": "задержка", "down1": "1 поток", "down4": "4 потока"}
+    r = bench(None if args.json else (lambda s: print("… " + labels[s], file=sys.stderr)))
+    if args.json:
+        print(json.dumps(r, ensure_ascii=False))
+    else:
+        print_bench(r)
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="netmode", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+    s = sub.add_parser("status")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--deep", action="store_true")
+    s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("set")
+    s.add_argument("mode")
+    s.add_argument("-q", "--quiet", action="store_true")
+    s.set_defaults(fn=lambda a: set_mode(a.mode, a.quiet))
+    s = sub.add_parser("modes")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_modes)
+    sub.add_parser("pulse").set_defaults(fn=cmd_pulse)
+    s = sub.add_parser("bench")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_bench)
+    s = sub.add_parser("get")
+    s.add_argument("url")
+    s.add_argument("-o", "--output")
+    s.add_argument("-n", "--connections", type=int, default=16)
+    s.set_defaults(fn=cmd_get)
+    s = sub.add_parser("auto")
+    s.add_argument("state", nargs="?", choices=["on", "off"])
+    s.set_defaults(fn=cmd_auto)
+    s = sub.add_parser("keepalive")
+    s.add_argument("--hz", type=float, default=100)
+    s.set_defaults(fn=cmd_keepalive)
+    sub.add_parser("watch").set_defaults(fn=cmd_watch)
+    args = p.parse_args(argv)
+    if not args.cmd:
+        args = p.parse_args(["status"])
+    try:
+        return args.fn(args) or 0
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
