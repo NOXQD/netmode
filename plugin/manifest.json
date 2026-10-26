@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "noxqd.netmode",
+  "name": "NetMode",
+  "version": "0.1.0",
+  "author": "noxqd",
+  "license": "MIT",
+  "description": "Network profiles: video (AnimeLib), gaming, download. Shows ping in the bar, switches tuning in one click and can turn on the video profile by itself while AnimeLib is open.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "NetMode",
+    "description": "Network mode and ping; click for the profiles",
+    "category": "Info",
+    "aliases": ["net", "network", "wifi", "speed"],
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
