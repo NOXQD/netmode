@@ -120,6 +120,27 @@ class Downloader(unittest.TestCase):
         self.assertEqual(data, RangeHandler.payload)
 
 
+class Tune(unittest.TestCase):
+    cfg = cli.DEFAULT_CONFIG
+
+    def test_a_fresh_profile_gets_dns_priority_and_band(self):
+        cur = {"Home": {}, "FTTH-3333": {"connection.autoconnect-priority": "0"}}
+        cmds = cli.tune_commands("Home", ["Home", "FTTH-3333", "Cafe"], self.cfg, cur, True)
+        modify = next(c for c in cmds if c[3] == "Home")
+        self.assertIn("1.0.0.1 1.1.1.1", modify)
+        self.assertIn("connection.autoconnect-priority", modify)
+        self.assertIn("a", modify)
+        low = [c for c in cmds if c[3] == "FTTH-3333"]
+        self.assertEqual(low[0][-1], "-100")
+        self.assertFalse(any(c[3] == "Cafe" for c in cmds))          # other networks are not touched
+
+    def test_a_tuned_profile_needs_nothing(self):
+        cur = {"Home": {"ipv4.dns": "1.0.0.1 1.1.1.1", "ipv4.ignore-auto-dns": "yes", "ipv4.dns-priority": "-50",
+                        "connection.autoconnect-priority": "100", "802-11-wireless.band": "a"},
+               "FTTH-1": {"connection.autoconnect-priority": "-100"}}
+        self.assertEqual(cli.tune_commands("Home", ["Home", "FTTH-1"], self.cfg, cur, True), [])
+
+
 class Helpers(unittest.TestCase):
     def test_ping_parse(self):
         text = ("5 packets transmitted, 5 received, 0% packet loss, time 802ms\n"

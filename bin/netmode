@@ -10,6 +10,7 @@
     netmode auto [on|off]       auto-switch to video while AnimeLib is open
     netmode keepalive           keep the Wi-Fi link awake (100 tiny packets/s)
     netmode proxy               local accelerator for the AnimeLib video server
+    netmode tune                fast DNS and the right network priority on the Wi-Fi profile
     netmode game                record a game session (ping, jitter, drops, Wi-Fi, CPU, GPU)
     netmode watch               the daemon behind `auto`
 """
@@ -48,6 +49,9 @@ DEFAULT_CONFIG = {
     "auto_video": True,
     "patterns": [r"anime\s?lib", r"anilib"],
     "browsers": ["chromium", "chrome", "brave", "vivaldi", "firefox", "zen", "opera"],
+    "dns_servers": ["1.0.0.1", "1.1.1.1"],
+    "wifi_priority": 100,
+    "wifi_deprioritize": [r"^FTTH-"],        # SSIDs that should never win against the main network
     "auto_game": True,
     "game_processes": ["sober"],
     "proxy_port": 18765,
@@ -319,7 +323,8 @@ def fmt_ping(p):
 
 def print_bench(r):
     print("режим        %s" % r["mode"])
-    print("DNS          кэш %s мс, без кэша %s мс" % (r["dns"]["cached_ms"], r["dns"]["miss_ms"]))
+    print("DNS          кэш %s мс, без кэша %s мс%s" % (r["dns"]["cached_ms"], r["dns"]["miss_ms"],
+          "   (медленно, поможет netmode tune)" if (r["dns"]["miss_ms"] or 0) > 60 else ""))
     print("роутер       %s" % fmt_ping(r["gateway"]))
     print("интернет     %s" % fmt_ping(r["internet"]))
     print("под нагрузкой %s" % fmt_ping(r["loaded"]))
@@ -922,6 +927,79 @@ def proxy_stats():
         return None
 
 
+# ---------------------------------------------------------------- wifi profile tuning
+
+def nm_active_wifi():
+    """(profile name, ssid) of the Wi-Fi connection that is up, or None."""
+    for line in out(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"]).splitlines():
+        parts = line.rsplit(":", 2)
+        if len(parts) == 3 and parts[1] == "802-11-wireless":
+            return parts[0].replace("\\:", ":")
+    return None
+
+
+def nm_wifi_profiles():
+    names = []
+    for line in out(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"]).splitlines():
+        name, _, kind = line.rpartition(":")
+        if kind == "802-11-wireless":
+            names.append(name.replace("\\:", ":"))
+    return names
+
+
+def tune_commands(active, profiles, cfg, current, on_5ghz):
+    """nmcli calls that bring the profile to the wanted state; `current` maps profile -> setting dict."""
+    cmds = []
+    want = {"ipv4.dns": ",".join(cfg["dns_servers"]), "ipv4.ignore-auto-dns": "yes", "ipv4.dns-priority": "-50",
+            "connection.autoconnect-priority": str(cfg["wifi_priority"])}
+    if on_5ghz:
+        want["802-11-wireless.band"] = "a"
+    have = current.get(active, {})
+    args = []
+    for key, value in want.items():
+        if have.get(key, "").replace(",", " ").split() != value.replace(",", " ").split():
+            args += [key, value.replace(",", " ") if key == "ipv4.dns" else value]
+    if args:
+        cmds.append(["nmcli", "connection", "modify", active] + args)
+    for name in profiles:
+        if name != active and any(re.search(p, name) for p in cfg["wifi_deprioritize"]):
+            if current.get(name, {}).get("connection.autoconnect-priority") != "-100":
+                cmds.append(["nmcli", "connection", "modify", name, "connection.autoconnect-priority", "-100"])
+    return cmds
+
+
+def cmd_tune(args):
+    active = nm_active_wifi()
+    if not active:
+        print("нет активного Wi-Fi", file=sys.stderr)
+        return 1
+    cfg = config()
+    profiles = nm_wifi_profiles()
+    keys = ["ipv4.dns", "ipv4.ignore-auto-dns", "ipv4.dns-priority", "connection.autoconnect-priority", "802-11-wireless.band"]
+    current = {}
+    for name in profiles:
+        vals = {}
+        for k in keys:
+            vals[k] = out(["nmcli", "-g", k, "connection", "show", name]).strip().replace(",", " ") if k == "ipv4.dns" \
+                else out(["nmcli", "-g", k, "connection", "show", name]).strip()
+        current[name] = vals
+    info = wifi_info() or {}
+    cmds = tune_commands(active, profiles, cfg, current, (info.get("freq") or 0) > 5000)
+    if not cmds:
+        print("профиль %s уже настроен" % active)
+        return 0
+    for c in cmds:
+        print(" ".join(c[2:]) if args.dry_run else "nmcli " + " ".join(c[1:]))
+        if not args.dry_run and subprocess.run(c).returncode != 0:
+            print("не удалось применить: нужны права на настройку сети", file=sys.stderr)
+            return 1
+    if not args.dry_run:
+        subprocess.run(["nmcli", "device", "reapply", info.get("iface", "wlo1")], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)   # the band applies at the next connect
+        print("готово: DNS %s, профиль %s в приоритете" % (", ".join(cfg["dns_servers"]), active))
+    return 0
+
+
 # ---------------------------------------------------------------- game sessions
 
 def game_pids(cfg):
@@ -1375,6 +1453,9 @@ def main(argv=None):
     s.add_argument("--hz", type=float, default=100)
     s.set_defaults(fn=cmd_keepalive)
     sub.add_parser("token").set_defaults(fn=cmd_token)
+    s = sub.add_parser("tune")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(fn=cmd_tune)
     s = sub.add_parser("game")
     s.add_argument("--seconds", type=int, default=0)
     s.set_defaults(fn=cmd_game)

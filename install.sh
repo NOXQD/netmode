@@ -89,6 +89,8 @@ systemctl --user daemon-reload
 systemctl --user enable --now netmode-watch.service netmode-proxy.service >/dev/null 2>&1 || true
 systemctl --user restart netmode-watch.service netmode-proxy.service || true
 
+"$exe" tune || true
+
 if ! grep -q "\"$plugin_id\"" "$HOME/.config/omarchy/shell.json" 2>/dev/null; then
   omarchy plugin enable "$plugin_id" || echo "enable it with: omarchy plugin enable $plugin_id"
 fi
