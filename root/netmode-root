@@ -31,6 +31,8 @@ BASE = {
     "net.ipv4.tcp_mtu_probing": "1",
     "net.core.rmem_max": "16777216",
     "net.core.wmem_max": "16777216",
+    "net.core.rmem_default": "1048576",
+    "net.core.wmem_default": "1048576",
     "net.ipv4.tcp_rmem": "4096 131072 33554432",
     "net.ipv4.tcp_wmem": "4096 16384 16777216",
     "net.core.netdev_max_backlog": "4096",
@@ -68,10 +70,16 @@ MODES = {
         "blurb": "Минимальный пинг и джиттер",
         "wifi_awake": True,
         "keepalive": False,
+        "qos": True,
         "sysctl": {
             "net.ipv4.tcp_notsent_lowat": "16384",
             "net.core.busy_poll": "50",
             "net.core.busy_read": "50",
+            # Roblox reads its UDP socket from one busy thread; a 208 KB buffer
+            # overflowed and the kernel dropped game packets.
+            "net.core.rmem_default": "4194304",
+            "net.core.wmem_default": "4194304",
+            "net.core.netdev_max_backlog": "8192",
         },
     },
     "download": {
@@ -158,6 +166,34 @@ def pci_power(iface, awake):
         return "%s: %s" % (path, e.strerror)
 
 
+# Roblox servers (AS22697). Game traffic is UDP to a high port; marking it EF makes
+# the Wi-Fi driver send it in the video access category, ahead of bulk traffic.
+QOS_RULES = """
+table inet netmode {
+  chain output {
+    type filter hook output priority mangle; policy accept;
+    ip daddr 128.116.0.0/16 udp dport 49152-65535 ip dscp set ef
+  }
+}
+"""
+
+
+def set_qos(enabled):
+    nft = "/usr/bin/nft"
+    if not os.path.exists(nft):
+        return None
+    try:
+        subprocess.run([nft, "delete", "table", "inet", "netmode"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        if enabled:
+            r = subprocess.run([nft, "-f", "-"], input=QOS_RULES, text=True, capture_output=True, timeout=10)
+            if r.returncode != 0:
+                return "nft: " + r.stderr.strip()[:120]
+    except (OSError, subprocess.SubprocessError) as e:
+        return "nft: %s" % e
+    return None
+
+
 def apply(mode):
     spec = MODES[mode]
     errors = []
@@ -177,6 +213,9 @@ def apply(mode):
         err = pci_power(iface, spec["wifi_awake"] or on_ac())
         if err:
             errors.append(err)
+    err = set_qos(spec.get("qos", False))
+    if err:
+        errors.append(err)
     os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w") as f:

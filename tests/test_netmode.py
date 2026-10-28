@@ -36,6 +36,13 @@ class ModeTable(unittest.TestCase):
             for field in ("name", "icon", "blurb", "wifi_awake", "sysctl"):
                 self.assertIn(field, spec, mode)
 
+    def test_game_profile_enlarges_udp_buffers_and_marks_traffic(self):
+        g = helper.MODES["gaming"]
+        self.assertGreater(int(g["sysctl"]["net.core.rmem_default"]), int(helper.BASE["net.core.rmem_default"]))
+        self.assertTrue(g["qos"])
+        self.assertFalse(any(m.get("qos") for k, m in helper.MODES.items() if k != "gaming"))
+        self.assertIn("ip dscp set ef", helper.QOS_RULES)
+
     def test_blurbs_fit_the_card(self):
         for spec in helper.MODES.values():
             self.assertLessEqual(len(spec["blurb"]), 30)

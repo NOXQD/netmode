@@ -10,6 +10,7 @@
     netmode auto [on|off]       auto-switch to video while AnimeLib is open
     netmode keepalive           keep the Wi-Fi link awake (100 tiny packets/s)
     netmode proxy               local accelerator for the AnimeLib video server
+    netmode game                record a game session (ping, jitter, drops, Wi-Fi, CPU, GPU)
     netmode watch               the daemon behind `auto`
 """
 import argparse
@@ -47,6 +48,8 @@ DEFAULT_CONFIG = {
     "auto_video": True,
     "patterns": [r"anime\s?lib", r"anilib"],
     "browsers": ["chromium", "chrome", "brave", "vivaldi", "firefox", "zen", "opera"],
+    "auto_game": True,
+    "game_processes": ["sober"],
     "proxy_port": 18765,
     "proxy_ahead_mb": 160,
     "proxy_hosts": [],                       # empty: any public host
@@ -919,6 +922,273 @@ def proxy_stats():
         return None
 
 
+# ---------------------------------------------------------------- game sessions
+
+def game_pids(cfg):
+    names = set(cfg["game_processes"])
+    pids = []
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                with open("/proc/%s/comm" % d) as f:
+                    if f.read().strip() in names:
+                        pids.append(int(d))
+            except OSError:
+                pass
+    return pids
+
+
+def game_running(cfg):
+    return bool(game_pids(cfg))
+
+
+def thread_ticks(pid):
+    """{tid: utime+stime} for every thread of the process."""
+    out = {}
+    try:
+        for tid in os.listdir("/proc/%d/task" % pid):
+            with open("/proc/%d/task/%s/stat" % (pid, tid)) as f:
+                raw = f.read()
+            fields = raw[raw.rindex(")") + 2:].split()
+            out[tid] = int(fields[11]) + int(fields[12])
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def udp_sockets(pids):
+    """UDP sockets of the game: (peer address, packets dropped by the kernel)."""
+    text = out(["ss", "-uamnp"], timeout=3)
+    socks, cur = [], None
+    for line in text.splitlines():
+        if "pid=" in line:
+            m = re.search(r"pid=(\d+)", line)
+            cols = line.split()
+            cur = (cols[4] if len(cols) > 4 else "", int(m.group(1))) if m and int(m.group(1)) in pids else None
+        elif cur and "skmem" in line:
+            d = re.search(r",d(\d+)\)", line)
+            socks.append((cur[0], int(d.group(1)) if d else 0))
+            cur = None
+    return socks
+
+
+def gpu_sample():
+    text = out(["nvidia-smi", "--query-gpu=utilization.gpu,clocks.gr,power.draw,temperature.gpu,pstate,"
+                "clocks_throttle_reasons.active", "--format=csv,noheader,nounits"], timeout=3)
+    try:
+        util, clock, power, temp, pstate, reasons = [x.strip() for x in text.strip().split(",")]
+        return {"util": int(util), "clock": int(clock), "power": float(power), "temp": int(temp),
+                "pstate": pstate, "reasons": int(reasons, 16)}
+    except ValueError:
+        return None
+
+
+THROTTLE = {0x1: "простой", 0x2: "ограничение приложения", 0x4: "лимит мощности", 0x8: "перегрев (аппаратный)",
+            0x20: "перегрев (программный)", 0x40: "лимит питания", 0x80: "перегрев (аппаратный)"}
+
+
+def wifi_counters():
+    iface = wifi_iface()
+    text = out(["iw", "dev", iface, "station", "dump"]) if iface else ""
+    c = {}
+    for key, rx in (("retries", r"tx retries:\s+(\d+)"), ("failed", r"tx failed:\s+(\d+)"),
+                    ("signal", r"signal:\s+(-?\d+)")):
+        m = re.search(rx, text)
+        c[key] = int(m.group(1)) if m else 0
+    return c
+
+
+def udp_rcvbuf_errors():
+    try:
+        with open("/proc/net/snmp") as f:
+            lines = [l for l in f if l.startswith("Udp:")]
+        head, vals = lines[0].split(), lines[1].split()
+        return int(vals[head.index("RcvbufErrors")])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def tcp_rtt(ip, port=443, timeout=1.0):
+    s = socket.socket()
+    s.settimeout(timeout)
+    t0 = time.perf_counter()
+    try:
+        s.connect((ip, port))
+        return (time.perf_counter() - t0) * 1000
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def pct(values, q):
+    v = sorted(values)
+    return v[min(len(v) - 1, int(len(v) * q))] if v else None
+
+
+def summarize(samples):
+    def col(k):
+        return [x[k] for x in samples if x.get(k) is not None]
+    rtt, gw = col("rtt"), col("gw")
+    res = {"seconds": len(samples), "mode": samples[-1]["mode"] if samples else None}
+    if rtt:
+        res["rtt_p50"], res["rtt_p95"], res["rtt_max"] = pct(rtt, .5), pct(rtt, .95), max(rtt)
+        res["rtt_spikes"] = sum(1 for x in rtt if x > pct(rtt, .5) + 60)
+    if gw:
+        res["gw_p50"], res["gw_p95"], res["gw_max"] = pct(gw, .5), pct(gw, .95), max(gw)
+    gw_all = [x.get("gw") for x in samples]
+    res["gw_lost"] = sum(1 for x in gw_all if x is None)
+    res["udp_drops"] = max(0, samples[-1]["drops"] - samples[0]["drops"]) if samples else 0
+    res["rcvbuf_errors"] = max(0, samples[-1]["rcvbuf"] - samples[0]["rcvbuf"]) if samples else 0
+    res["wifi_retries"] = max(0, samples[-1]["retries"] - samples[0]["retries"]) if samples else 0
+    res["wifi_failed"] = max(0, samples[-1]["failed"] - samples[0]["failed"]) if samples else 0
+    res["signal_min"] = min(col("signal")) if col("signal") else None
+    res["thread_max_p95"] = pct(col("thread"), .95)
+    gpu = [x["gpu"] for x in samples if x.get("gpu")]
+    if gpu:
+        res["gpu_util_p50"] = pct([g["util"] for g in gpu], .5)
+        res["gpu_util_p95"] = pct([g["util"] for g in gpu], .95)
+        res["gpu_clock_min"] = min(g["clock"] for g in gpu)
+        res["gpu_temp_max"] = max(g["temp"] for g in gpu)
+        reasons = 0
+        for g in gpu:
+            reasons |= g["reasons"] & ~0x1 & ~0x4000000000000000
+        res["gpu_throttle"] = [name for bit, name in THROTTLE.items() if reasons & bit and bit != 0x1]
+    return res
+
+
+def verdict(r):
+    """Plain-language findings ordered by how likely they explain lag."""
+    notes = []
+    if r.get("rtt_p50") is not None and r["rtt_p50"] > 150:
+        notes.append("Далеко до серверов Roblox: медиана %.0f мс. Это маршрут провайдера, настройками не лечится." % r["rtt_p50"])
+    if r.get("rtt_p95") is not None and r.get("rtt_p50") is not None and r["rtt_p95"] - r["rtt_p50"] > 50:
+        notes.append("Задержка до Roblox скачет: p50 %.0f, p95 %.0f мс (%d выбросов). Рывки персонажа и лаги ввода." % (r["rtt_p50"], r["rtt_p95"], r.get("rtt_spikes", 0)))
+    if r.get("gw_p95") is not None and r["gw_p95"] > 25:
+        notes.append("Wi-Fi до роутера нестабилен: p95 %.0f мс, максимум %.0f. Это локальная проблема, не интернет." % (r["gw_p95"], r["gw_max"]))
+    if r.get("gw_lost", 0) > 2:
+        notes.append("До роутера потеряно %d из %d пингов: Wi-Fi теряет пакеты." % (r["gw_lost"], r["seconds"]))
+    if r.get("wifi_failed", 0) > 0 or r.get("wifi_retries", 0) > r["seconds"] * 20:
+        notes.append("Много повторных передач Wi-Fi (%d, из них неудачных %d): помехи или сигнал." % (r["wifi_retries"], r["wifi_failed"]))
+    if r.get("udp_drops", 0) > 0 or r.get("rcvbuf_errors", 0) > 0:
+        notes.append("Ядро отбросило UDP-пакеты игры (%d, переполнение буфера приёма): игра не успевала их читать." % max(r["udp_drops"], r["rcvbuf_errors"]))
+    if r.get("gpu_throttle"):
+        notes.append("Видеокарта сбрасывает частоту: %s (температура до %d°C, минимум %d МГц)." % (", ".join(sorted(set(r["gpu_throttle"]))), r.get("gpu_temp_max", 0), r.get("gpu_clock_min", 0)))
+    if r.get("gpu_util_p95", 0) >= 97:
+        notes.append("Видеокарта загружена на 97%+: FPS упирается в неё, а не в сеть. Нужно снижать графику.")
+    if r.get("thread_max_p95", 0) >= 95:
+        notes.append("Один поток игры занят на 95%+ ядра: упирается в процессор (главный поток Roblox).")
+    if not notes:
+        notes.append("Явных проблем с сетью, Wi-Fi, процессором и видеокартой в этой сессии не видно.")
+    return notes
+
+
+def cmd_game(args):
+    cfg = config()
+    deadline = time.monotonic() + args.seconds if args.seconds else None
+    pids = game_pids(cfg)
+    if not pids:
+        print("игра не запущена, жду процесс %s…" % ", ".join(cfg["game_processes"]), file=sys.stderr)
+        while not pids and (deadline is None or time.monotonic() < deadline):
+            time.sleep(1)
+            pids = game_pids(cfg)
+        if not pids:
+            return 1
+    window = None
+    try:
+        for c in json.loads(out(["hyprctl", "clients", "-j"])):
+            if c.get("pid") in pids or c.get("class", "").lower().find("sober") >= 0:
+                window = {"class": c.get("class"), "title": c.get("title"), "fullscreen": c.get("fullscreen"),
+                          "size": c.get("size")}
+                break
+    except ValueError:
+        pass
+    os.makedirs(STATE_DIR, exist_ok=True)
+    path = "%s/game-%s.csv" % (STATE_DIR, time.strftime("%Y%m%d-%H%M%S"))
+    gw_ip = default_gateway()
+    samples, ticks, hz = [], {}, os.sysconf("SC_CLK_TCK")
+    wifi = wifi_counters()
+    base_drops = None
+    web_ip, web_fail = None, 0
+    n = 0
+    pool = cf.ThreadPoolExecutor(2)
+    print("запись сессии: %s (Ctrl-C — остановить и показать итог)" % path, file=sys.stderr)
+    try:
+        while (deadline is None or time.monotonic() < deadline):
+            t0 = time.monotonic()
+            pids = game_pids(cfg)
+            if not pids:
+                break
+            f_gw = pool.submit(lambda: ping(gw_ip, 1, 0.2)) if gw_ip else None
+            socks = udp_sockets(set(pids))
+            peers = [p for p, _ in socks if p and not p.startswith(("127.", "[", "0.0.0.0", "*"))]
+            if peers and web_ip is None:
+                web_ip = peers[0].rsplit(":", 1)[0].rsplit(".", 1)[0] + ".3"
+            f_rtt = pool.submit(tcp_rtt, web_ip or "128.116.5.3") if n % 2 == 0 else None
+            cur = {}
+            for pid in pids:
+                for tid, tk in thread_ticks(pid).items():
+                    cur[(pid, tid)] = tk
+            busiest = 0.0
+            for k, tk in cur.items():
+                if k in ticks:
+                    busiest = max(busiest, (tk - ticks[k]) / hz * 100)
+            ticks = cur
+            if n % 2 == 0:
+                wifi = wifi_counters()
+            gpu = gpu_sample() if n % 2 == 0 else (samples[-1].get("gpu") if samples else None)
+            gwp = f_gw.result() if f_gw else None
+            rtt = f_rtt.result() if f_rtt else None
+            if rtt is None and f_rtt:
+                web_fail += 1
+                if web_fail >= 3:
+                    web_ip, web_fail = "128.116.5.3", 0
+            samples.append({"t": n, "mode": current_mode(), "gw": gwp["avg"] if gwp and "avg" in gwp else None,
+                            "rtt": rtt, "drops": sum(d for _, d in socks), "rcvbuf": udp_rcvbuf_errors(),
+                            "retries": wifi["retries"], "failed": wifi["failed"], "signal": wifi["signal"],
+                            "thread": busiest, "gpu": gpu})
+            n += 1
+            time.sleep(max(0.0, 1.0 - (time.monotonic() - t0)))
+    except KeyboardInterrupt:
+        pass
+    if len(samples) < 5:
+        return 1
+    with open(path, "w") as f:
+        f.write("t,mode,gw_ms,rtt_ms,udp_drops,rcvbuf_errors,wifi_retries,wifi_failed,signal,busiest_thread_pct,gpu_util,gpu_clock,gpu_temp,gpu_reasons\n")
+        for x in samples:
+            g = x.get("gpu") or {}
+            f.write("%d,%s,%s,%s,%d,%d,%d,%d,%d,%.0f,%s,%s,%s,%s\n" % (
+                x["t"], x["mode"], "" if x["gw"] is None else "%.1f" % x["gw"], "" if x["rtt"] is None else "%.1f" % x["rtt"],
+                x["drops"], x["rcvbuf"], x["retries"], x["failed"], x["signal"], x["thread"],
+                g.get("util", ""), g.get("clock", ""), g.get("temp", ""), hex(g["reasons"]) if g else ""))
+    result = summarize(samples)
+    result["notes"] = verdict(result)
+    result["when"] = int(time.time())
+    result["window"] = window
+    save_json(STATE_DIR + "/game-last.json", result)
+    print_game(result)
+    csvs = sorted(f for f in os.listdir(STATE_DIR) if f.startswith("game-") and f.endswith(".csv"))
+    for f in csvs[:-8]:
+        os.remove(os.path.join(STATE_DIR, f))
+    return 0
+
+
+def print_game(r):
+    def ms(v):
+        return "—" if v is None else "%.0f мс" % v
+    print("сессия %d с, режим %s" % (r["seconds"], r["mode"]))
+    print("до Roblox        p50 %s  p95 %s  макс %s  выбросов %s" % (ms(r.get("rtt_p50")), ms(r.get("rtt_p95")), ms(r.get("rtt_max")), r.get("rtt_spikes", "—")))
+    print("до роутера       p50 %s  p95 %s  макс %s  потеряно %d" % (ms(r.get("gw_p50")), ms(r.get("gw_p95")), ms(r.get("gw_max")), r.get("gw_lost", 0)))
+    print("Wi-Fi            повторов %d, неудач %d, сигнал мин %s дБм" % (r["wifi_retries"], r["wifi_failed"], r.get("signal_min")))
+    print("UDP игры         сброшено ядром %d" % max(r["udp_drops"], r["rcvbuf_errors"]))
+    if "gpu_util_p50" in r:
+        print("видеокарта       загрузка p50 %d%% p95 %d%%, частота мин %d МГц, до %d°C" % (r["gpu_util_p50"], r["gpu_util_p95"], r["gpu_clock_min"], r["gpu_temp_max"]))
+    print("главный поток    p95 %s%% ядра" % (("%.0f" % r["thread_max_p95"]) if r.get("thread_max_p95") is not None else "—"))
+    print()
+    for note in r["notes"]:
+        print("• " + note)
+
+
 # ---------------------------------------------------------------- auto mode
 
 def video_window_open(cfg):
@@ -968,26 +1238,41 @@ def hypr_events():
 
 
 def cmd_watch(_args):
-    """Switch to video while a browser window shows AnimeLib, then put the old mode back."""
-    previous, owned, suppressed = None, False, False
+    """Pick the profile from what is open: Sober gets Games, AnimeLib gets Video.
+
+    The previous mode comes back when both are gone. A mode chosen by hand is
+    left alone until the trigger goes away.
+    """
+    previous, owned, suppressed = None, None, False
+    recorder = None
     last_check = 0.0
     for _ in hypr_events():
         if time.monotonic() - last_check < 1.0:
             continue
         last_check = time.monotonic()
         cfg = config()
-        want = cfg["auto_video"] and video_window_open(cfg)
+        game = cfg["auto_game"] and game_running(cfg)
+        video = cfg["auto_video"] and video_window_open(cfg)
+        want = "gaming" if game else ("video" if video else None)
         now = current_mode()
-        if want and not owned and not suppressed and now != "video":
+        if want and owned is None and not suppressed and now != want:
             previous = now
-            if set_mode("video") == 0:
-                owned = True
-        elif want and owned and now != "video":
-            owned, suppressed = False, True      # user picked another mode: leave it alone
+            if set_mode(want) == 0:
+                owned = want
+        elif want and owned and now != owned:
+            owned, suppressed = None, True            # a mode picked by hand: leave it alone
+        elif want and owned and want != owned:
+            if set_mode(want, quiet=True) == 0:
+                owned = want
         elif not want:
-            if owned and now == "video":
+            if owned and now == owned:
                 set_mode(previous or "balanced")
-            owned, suppressed = False, False
+            owned, suppressed = None, False
+        if game and (recorder is None or recorder.poll() is not None):
+            recorder = subprocess.Popen([sys.executable, os.path.abspath(__file__), "game"],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif not game and recorder is not None and recorder.poll() is not None:
+            recorder = None
 
 
 def cmd_auto(args):
@@ -1090,6 +1375,9 @@ def main(argv=None):
     s.add_argument("--hz", type=float, default=100)
     s.set_defaults(fn=cmd_keepalive)
     sub.add_parser("token").set_defaults(fn=cmd_token)
+    s = sub.add_parser("game")
+    s.add_argument("--seconds", type=int, default=0)
+    s.set_defaults(fn=cmd_game)
     sub.add_parser("watch").set_defaults(fn=cmd_watch)
     args = p.parse_args(argv)
     if not args.cmd:
