@@ -293,7 +293,7 @@ def throughput(streams, seconds=4.0):
     for t in threads:
         t.join()
     elapsed = max(time.monotonic() - t0, 0.001)
-    return round(counter[0] * 8 / elapsed / 1e6, 1)
+    return round(counter[0] * 8 / elapsed / 1e6, 1) if counter[0] else None     # None: the test server refused
 
 
 def bench(progress=None):
@@ -328,7 +328,10 @@ def print_bench(r):
     print("роутер       %s" % fmt_ping(r["gateway"]))
     print("интернет     %s" % fmt_ping(r["internet"]))
     print("под нагрузкой %s" % fmt_ping(r["loaded"]))
-    print("скачивание   1 поток %s Мбит/с, 4 потока %s Мбит/с" % (r["down_1"], r["down_4"]))
+    if r["down_1"] is None and r["down_4"] is None:
+        print("скачивание   нет данных: сервер теста не отдал файл (лимит запросов), повторите позже")
+    else:
+        print("скачивание   1 поток %s Мбит/с, 4 потока %s Мбит/с" % (r["down_1"], r["down_4"]))
 
 
 # ---------------------------------------------------------------- downloader

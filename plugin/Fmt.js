@@ -52,6 +52,7 @@ function stats(snap, keepalive) {
 function benchRows(b) {
   if (!b) return []
   var rows = []
+  if (b.down_1 === null || b.down_1 === undefined) return rows
   rows.push({ k: "Скачивание", v: Math.round(b.down_1) + " / " + mbit(b.down_4) + "  (1 и 4 потока)" })
   rows.push({ k: "Под нагрузкой", v: ping(b.loaded) })
   rows.push({ k: "DNS-запрос", v: "кэш " + ms(b.dns.cached_ms) + "  ·  без кэша " + ms(b.dns.miss_ms) })
