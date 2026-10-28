@@ -165,6 +165,14 @@ def wifi_iface():
     return None
 
 
+def wifi_standard(bitrate_line):
+    """("Wi-Fi 6", 160) from an `iw link` bitrate line, e.g. '... VHT-MCS 9 80MHz ...'."""
+    std = ("Wi-Fi 7" if "EHT" in bitrate_line else "Wi-Fi 6" if "HE-MCS" in bitrate_line
+           else "Wi-Fi 5" if "VHT" in bitrate_line else "Wi-Fi 4" if "MCS" in bitrate_line else None)
+    m = re.search(r"(\d+)MHz", bitrate_line)
+    return std, int(m.group(1)) if m else None
+
+
 def wifi_info():
     iface = wifi_iface()
     if not iface:
@@ -180,6 +188,9 @@ def wifi_info():
         if m:
             v = m.group(1)
             info[key] = v if key == "ssid" else float(v)
+    m = re.search(r"tx bitrate: (.+)", text)
+    if m:
+        info["standard"], info["width"] = wifi_standard(m.group(1))
     return info
 
 

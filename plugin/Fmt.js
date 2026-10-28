@@ -41,6 +41,8 @@ function stats(snap, keepalive) {
   var w = snap.wifi
   if (w && w.connected)
     rows.push({ k: "Wi-Fi", v: (w.ssid || "") + "  " + w.signal + " дБм  " + Math.round(w.rx) + "/" + Math.round(w.tx) + " Мбит/с" })
+  if (w && w.connected && w.standard)
+    rows.push({ k: "Стандарт", v: w.standard + "  ·  " + w.width + " МГц" })
   rows.push({ k: "Роутер", v: ping(snap.gateway) })
   rows.push({ k: "Интернет", v: ping(snap.internet) + "  · " + quality(snap.internet) })
   rows.push({ k: "DNS", v: dnsName(snap.dns) })

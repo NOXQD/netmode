@@ -120,6 +120,13 @@ class Downloader(unittest.TestCase):
         self.assertEqual(data, RangeHandler.payload)
 
 
+class WifiStandard(unittest.TestCase):
+    def test_standards_and_width(self):
+        self.assertEqual(cli.wifi_standard("866.7 MBit/s VHT-MCS 9 80MHz short GI VHT-NSS 2"), ("Wi-Fi 5", 80))
+        self.assertEqual(cli.wifi_standard("1201.0 MBit/s 160MHz HE-MCS 9 HE-NSS 2 HE-GI 0"), ("Wi-Fi 6", 160))
+        self.assertEqual(cli.wifi_standard("144.4 MBit/s MCS 15 short GI"), ("Wi-Fi 4", None))
+
+
 class Tune(unittest.TestCase):
     cfg = cli.DEFAULT_CONFIG
 
